@@ -20,7 +20,7 @@ struct ApiResponse {
 #[derive(Debug, Deserialize)]
 struct ClientInfo {
     ip: String,
-    isp: String,
+    isp: Option<String>,
     location: Location,
 }
 
@@ -461,7 +461,7 @@ fn print_json(results: &TestResults, client: &ClientInfo, servers: &[String]) {
         },
         client: JsonClient {
             ip: client.ip.clone(),
-            isp: client.isp.clone(),
+            isp: client.isp.clone().unwrap_or_else(|| "Unknown".to_string()),
             city: client.location.city.clone(),
             country: client.location.country.clone(),
         },
@@ -489,7 +489,11 @@ fn print_results(results: &TestResults, client: &ClientInfo, servers: &[String])
         "   Client     {}, {}",
         client.location.city, client.location.country
     );
-    println!("              {}  {}", client.ip, client.isp);
+    println!(
+        "              {}  {}",
+        client.ip,
+        client.isp.as_deref().unwrap_or("Unknown")
+    );
     println!("   Server(s)  {}", servers.join(" | "));
     println!();
     println!(
