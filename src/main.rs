@@ -1,78 +1,15 @@
-use futures::StreamExt;
-use serde::{Deserialize, Serialize};
-use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+mod display;
+mod test;
+mod tui;
+mod types;
+
+use std::time::Duration;
+use types::{ApiResponse, DataPoint, TestHistory, TestResults, TestState};
 
 const API_URL: &str = "https://api.fast.com/netflix/speedtest/v2";
 const TOKEN: &str = "YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm";
-const CHUNK_SIZE: u64 = 26_214_400; // 25 MB download chunks
-const TEST_DURATION: Duration = Duration::from_secs(10);
 const PARALLEL_STREAMS: usize = 4;
-
-#[derive(Debug, Deserialize)]
-struct ApiResponse {
-    client: ClientInfo,
-    targets: Vec<Target>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClientInfo {
-    ip: String,
-    isp: Option<String>,
-    location: Location,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct Location {
-    city: String,
-    country: String,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct Target {
-    url: String,
-    location: Location,
-}
-
-struct TestResults {
-    download_speed: f64,
-    upload_speed: f64,
-    latency_unloaded: f64,
-    latency_loaded: f64,
-    downloaded_bytes: u64,
-    uploaded_bytes: u64,
-}
-
-#[derive(Serialize)]
-struct JsonOutput {
-    download: SpeedResult,
-    upload: SpeedResult,
-    latency: LatencyResult,
-    client: JsonClient,
-    servers: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct SpeedResult {
-    bps: f64,
-    bytes: u64,
-}
-
-#[derive(Serialize)]
-struct LatencyResult {
-    unloaded_ms: f64,
-    loaded_ms: f64,
-}
-
-#[derive(Serialize)]
-struct JsonClient {
-    ip: String,
-    isp: String,
-    city: String,
-    country: String,
-}
+const TEST_DURATION: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -84,16 +21,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Fetch speedtest targets
-    if !json_mode {
-        print!("Connecting...");
-        std::io::stdout().flush()?;
+    if json_mode {
+        // Silent mode for JSON
+    } else {
+        print!("Connecting to fast.com...");
+        std::io::Write::flush(&mut std::io::stdout())?;
     }
 
     let url = format!("{}?https=true&token={}&urlCount=5", API_URL, TOKEN);
     let response: ApiResponse = client.get(&url).send().await?.json().await?;
 
     if !json_mode {
-        print!("\r\x1b[K"); // Clear line
+        print!("\r\x1b[K");
     }
 
     if response.targets.is_empty() {
@@ -105,14 +44,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Use first few targets for parallel streams
     let targets: Vec<_> = response
         .targets
         .into_iter()
         .take(PARALLEL_STREAMS)
         .collect();
 
-    // Collect server locations
     let servers: Vec<String> = targets
         .iter()
         .map(|t| format!("{}, {}", t.location.city, t.location.country))
@@ -120,412 +57,156 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .collect();
 
-    // Run download test immediately
-    if !json_mode {
-        println!("Download");
-    }
-    let (download_speed, downloaded_bytes, latency_loaded) =
-        run_download_test(&client, &targets, json_mode).await?;
-
-    // Run upload test
-    if !json_mode {
-        println!("\nUpload");
-    }
-    let (upload_speed, uploaded_bytes) = run_upload_test(&client, &targets, json_mode).await?;
-
-    // Measure unloaded latency after tests complete
-    if !json_mode {
-        print!("\nMeasuring latency...");
-        std::io::stdout().flush()?;
-    }
-    let latency_unloaded = measure_latency(&client, &targets[0]).await?;
-    if !json_mode {
-        print!("\r\x1b[K");
-    }
-
-    let results = TestResults {
-        download_speed,
-        upload_speed,
-        latency_unloaded,
-        latency_loaded,
-        downloaded_bytes,
-        uploaded_bytes,
-    };
-
-    // Display results
     if json_mode {
-        print_json(&results, &response.client, &servers);
+        // Run without TUI for JSON mode
+        run_json_mode(&client, &targets, &response.client, &servers).await?;
     } else {
-        print_results(&results, &response.client, &servers);
+        // Run with TUI
+        run_tui_mode(&client, &targets, &response.client, &servers).await?;
     }
 
     Ok(())
 }
 
-async fn measure_latency(client: &reqwest::Client, target: &Target) -> Result<f64, Box<dyn std::error::Error>> {
-    let url = make_latency_url(&target.url);
-    let mut latencies = Vec::new();
-
-    // Take 5 measurements
-    for _ in 0..5 {
-        let start = Instant::now();
-        if client
-            .post(&url)
-            .timeout(Duration::from_secs(5))
-            .body("")
-            .send()
-            .await
-            .is_ok()
-        {
-            latencies.push(start.elapsed().as_secs_f64() * 1000.0);
-        }
-    }
-
-    // Return median or 0 if no successful measurements
-    if latencies.is_empty() {
-        return Ok(0.0);
-    }
-    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    Ok(latencies[latencies.len() / 2])
-}
-
-fn make_latency_url(base_url: &str) -> String {
-    if let Some(idx) = base_url.find('?') {
-        let (base, query) = base_url.split_at(idx);
-        format!("{}/range/0-0{}", base, query)
-    } else {
-        format!("{}/range/0-0", base_url)
-    }
-}
-
-fn make_download_url(base_url: &str) -> String {
-    if let Some(idx) = base_url.find('?') {
-        let (base, query) = base_url.split_at(idx);
-        format!("{}/range/0-{}{}", base, CHUNK_SIZE, query)
-    } else {
-        format!("{}/range/0-{}", base_url, CHUNK_SIZE)
-    }
-}
-
-fn make_upload_url(base_url: &str) -> String {
-    make_latency_url(base_url) // Upload uses same endpoint, just POST with body
-}
-
-async fn run_download_test(
+async fn run_json_mode(
     client: &reqwest::Client,
-    targets: &[Target],
-    quiet: bool,
-) -> Result<(f64, u64, f64), Box<dyn std::error::Error>> {
-    let total_bytes = Arc::new(AtomicU64::new(0));
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let start = Instant::now();
+    targets: &[types::Target],
+    client_info: &types::ClientInfo,
+    servers: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state = TestState::new();
 
-    let urls: Vec<String> = targets.iter().map(|t| make_download_url(&t.url)).collect();
-    let latency_url = make_latency_url(&targets[0].url);
+    // Spawn all test tasks
+    let download_handles = test::spawn_download_tasks(client, targets, &state);
+    let upload_handles = test::spawn_upload_tasks(client, targets, &state);
+    let latency_handle = test::spawn_latency_task(client, &targets[0], &state);
 
-    // Spawn download tasks
-    let mut handles = Vec::new();
-    for url in &urls {
-        let client = client.clone();
-        let url = url.clone();
-        let total_bytes = Arc::clone(&total_bytes);
-        let stop_flag = Arc::clone(&stop_flag);
+    // Wait for test duration
+    tokio::time::sleep(TEST_DURATION).await;
+    let elapsed = state.elapsed().as_secs_f64();
 
-        handles.push(tokio::spawn(async move {
-            download_loop(&client, &url, total_bytes, stop_flag).await
-        }));
-    }
-
-    // Spawn latency measurement task
-    let loaded_latencies = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
-    let latency_stop = Arc::new(AtomicBool::new(false));
-    let latency_client = client.clone();
-    let latency_lats = Arc::clone(&loaded_latencies);
-    let latency_stop_clone = Arc::clone(&latency_stop);
-    let latency_url_clone = latency_url.clone();
-
-    let latency_handle = tokio::spawn(async move {
-        // Wait for download to ramp up
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        while !latency_stop_clone.load(Ordering::Relaxed) {
-            if let Ok(lat) = measure_single_latency(&latency_client, &latency_url_clone).await {
-                if let Ok(mut lats) = latency_lats.lock() {
-                    lats.push(lat);
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    });
-
-    // Progress display loop
-    let mut last_bytes = 0u64;
-    let mut last_time = Instant::now();
-    let mut speeds: Vec<f64> = Vec::new();
-
-    while start.elapsed() < TEST_DURATION {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-
-        let bytes = total_bytes.load(Ordering::Relaxed);
-        let now = Instant::now();
-        let dt = now.duration_since(last_time).as_secs_f64();
-
-        if dt > 0.0 && bytes > last_bytes {
-            let instant_speed = ((bytes - last_bytes) as f64 * 8.0) / dt;
-            speeds.push(instant_speed);
-
-            let avg_speed = if speeds.len() > 8 {
-                speeds[speeds.len() - 8..].iter().sum::<f64>() / 8.0
-            } else {
-                speeds.iter().sum::<f64>() / speeds.len() as f64
-            };
-
-            if !quiet {
-                print!("\r  {}   ", format_speed(avg_speed));
-                std::io::stdout().flush().ok();
-            }
-        }
-
-        last_bytes = bytes;
-        last_time = now;
-    }
-
-    latency_stop.store(true, Ordering::Relaxed);
+    // Stop all tasks
+    state.stop();
     let _ = latency_handle.await;
-
-    stop_flag.store(true, Ordering::Relaxed);
-    for handle in handles {
+    for handle in download_handles {
+        let _ = handle.await;
+    }
+    for handle in upload_handles {
         let _ = handle.await;
     }
 
-    let final_bytes = total_bytes.load(Ordering::Relaxed);
-    let elapsed = start.elapsed().as_secs_f64();
-    let speed = (final_bytes as f64 * 8.0) / elapsed;
+    // Measure unloaded latency
+    let latency_unloaded = test::measure_unloaded_latency(client, &targets[0]).await?;
 
-    // Calculate loaded latency (median)
-    let latency_loaded = if let Ok(mut lats) = loaded_latencies.lock() {
-        if !lats.is_empty() {
-            lats.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            lats[lats.len() / 2]
-        } else {
-            0.0
-        }
-    } else {
-        0.0
+    let download_bytes = state.get_download_bytes();
+    let upload_bytes = state.get_upload_bytes();
+
+    let results = TestResults {
+        download_speed: (download_bytes as f64 * 8.0) / elapsed,
+        upload_speed: (upload_bytes as f64 * 8.0) / elapsed,
+        latency_unloaded,
+        latency_loaded: state.get_median_latency(),
+        downloaded_bytes: download_bytes,
+        uploaded_bytes: upload_bytes,
     };
 
-    Ok((speed, final_bytes, latency_loaded))
+    display::print_json(&results, client_info, servers);
+    Ok(())
 }
 
-async fn measure_single_latency(client: &reqwest::Client, url: &str) -> Result<f64, reqwest::Error> {
-    let start = Instant::now();
-    let _ = client.post(url).body("").send().await?;
-    Ok(start.elapsed().as_secs_f64() * 1000.0)
-}
-
-async fn download_loop(
+async fn run_tui_mode(
     client: &reqwest::Client,
-    url: &str,
-    total_bytes: Arc<AtomicU64>,
-    stop_flag: Arc<AtomicBool>,
-) {
-    while !stop_flag.load(Ordering::Relaxed) {
-        if let Ok(response) = client.get(url).send().await {
-            let mut stream = response.bytes_stream();
+    targets: &[types::Target],
+    client_info: &types::ClientInfo,
+    servers: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut tui = tui::Tui::new()?;
+    let state = TestState::new();
+    let mut history = TestHistory::new();
 
-            while let Some(chunk) = stream.next().await {
-                if stop_flag.load(Ordering::Relaxed) {
-                    break;
-                }
-                if let Ok(data) = chunk {
-                    total_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
-                }
-            }
-        }
-    }
-}
+    // Spawn all test tasks concurrently
+    let download_handles = test::spawn_download_tasks(client, targets, &state);
+    let upload_handles = test::spawn_upload_tasks(client, targets, &state);
+    let latency_handle = test::spawn_latency_task(client, &targets[0], &state);
 
-async fn run_upload_test(
-    client: &reqwest::Client,
-    targets: &[Target],
-    quiet: bool,
-) -> Result<(f64, u64), Box<dyn std::error::Error>> {
-    let total_bytes = Arc::new(AtomicU64::new(0));
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let start = Instant::now();
+    let mut prev_download = 0u64;
+    let mut prev_upload = 0u64;
+    let mut last_sample = std::time::Instant::now();
 
-    let urls: Vec<String> = targets.iter().map(|t| make_upload_url(&t.url)).collect();
-
-    // Spawn upload tasks
-    let mut handles = Vec::new();
-    for url in &urls {
-        let client = client.clone();
-        let url = url.clone();
-        let total_bytes = Arc::clone(&total_bytes);
-        let stop_flag = Arc::clone(&stop_flag);
-
-        handles.push(tokio::spawn(async move {
-            upload_loop(&client, &url, total_bytes, stop_flag).await
-        }));
-    }
-
-    // Progress display loop
-    let mut last_bytes = 0u64;
-    let mut last_time = Instant::now();
-    let mut speeds: Vec<f64> = Vec::new();
-
-    while start.elapsed() < TEST_DURATION {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-
-        let bytes = total_bytes.load(Ordering::Relaxed);
-        let now = Instant::now();
-        let dt = now.duration_since(last_time).as_secs_f64();
-
-        if dt > 0.0 && bytes > last_bytes {
-            let instant_speed = ((bytes - last_bytes) as f64 * 8.0) / dt;
-            speeds.push(instant_speed);
-
-            let avg_speed = if speeds.len() > 8 {
-                speeds[speeds.len() - 8..].iter().sum::<f64>() / 8.0
-            } else {
-                speeds.iter().sum::<f64>() / speeds.len() as f64
-            };
-
-            if !quiet {
-                print!("\r  {}   ", format_speed(avg_speed));
-                std::io::stdout().flush().ok();
-            }
+    // Main UI loop
+    while state.elapsed() < TEST_DURATION {
+        // Check for quit
+        if tui.should_quit()? {
+            state.stop();
+            break;
         }
 
-        last_bytes = bytes;
-        last_time = now;
+        // Sample and record data
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(last_sample).as_secs_f64();
+
+        if dt >= 0.05 {
+            let point = tui::sample_state(&state, prev_download, prev_upload, dt);
+            history.add_point(point);
+            prev_download = state.get_download_bytes();
+            prev_upload = state.get_upload_bytes();
+            last_sample = now;
+        }
+
+        // Draw UI
+        tui.draw(&state, &history, client_info, servers, "Testing")?;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    stop_flag.store(true, Ordering::Relaxed);
-    for handle in handles {
+    let elapsed = state.elapsed().as_secs_f64();
+
+    // Signal stop and wait for tasks
+    state.stop();
+    let _ = latency_handle.await;
+    for handle in download_handles {
+        let _ = handle.await;
+    }
+    for handle in upload_handles {
         let _ = handle.await;
     }
 
-    let final_bytes = total_bytes.load(Ordering::Relaxed);
-    let elapsed = start.elapsed().as_secs_f64();
-    let speed = (final_bytes as f64 * 8.0) / elapsed;
+    // Final draw
+    tui.draw(&state, &history, client_info, servers, "Measuring unloaded latency...")?;
 
-    Ok((speed, final_bytes))
-}
+    // Measure unloaded latency (requires idle connection)
+    let latency_unloaded = test::measure_unloaded_latency(client, &targets[0]).await?;
 
-async fn upload_loop(
-    client: &reqwest::Client,
-    url: &str,
-    total_bytes: Arc<AtomicU64>,
-    stop_flag: Arc<AtomicBool>,
-) {
-    // Use 128KB chunks for upload
-    let chunk_size: usize = 131_072;
-    let chunk: Vec<u8> = vec![0u8; chunk_size];
+    // Calculate final results
+    let download_bytes = state.get_download_bytes();
+    let upload_bytes = state.get_upload_bytes();
 
-    while !stop_flag.load(Ordering::Relaxed) {
-        match client
-            .post(url)
-            .header("Content-Type", "application/octet-stream")
-            .timeout(Duration::from_secs(10))
-            .body(chunk.clone())
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                // Wait for response to complete
-                let _ = resp.bytes().await;
-                total_bytes.fetch_add(chunk_size as u64, Ordering::Relaxed);
-            }
-            Err(_) => {
-                // Small delay on error to avoid tight loop
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-    }
-}
-
-fn print_json(results: &TestResults, client: &ClientInfo, servers: &[String]) {
-    let output = JsonOutput {
-        download: SpeedResult {
-            bps: results.download_speed,
-            bytes: results.downloaded_bytes,
-        },
-        upload: SpeedResult {
-            bps: results.upload_speed,
-            bytes: results.uploaded_bytes,
-        },
-        latency: LatencyResult {
-            unloaded_ms: results.latency_unloaded,
-            loaded_ms: results.latency_loaded,
-        },
-        client: JsonClient {
-            ip: client.ip.clone(),
-            isp: client.isp.clone().unwrap_or_else(|| "Unknown".to_string()),
-            city: client.location.city.clone(),
-            country: client.location.country.clone(),
-        },
-        servers: servers.to_vec(),
+    // Add final point with average speeds
+    let final_point = DataPoint {
+        time: elapsed,
+        download_speed: (download_bytes as f64 * 8.0) / elapsed,
+        upload_speed: (upload_bytes as f64 * 8.0) / elapsed,
+        latency: state.get_median_latency(),
     };
-    println!("{}", serde_json::to_string(&output).unwrap());
-}
+    history.add_point(final_point);
 
-fn print_results(results: &TestResults, client: &ClientInfo, servers: &[String]) {
-    println!();
-    println!(
-        "   Download  {:>10}",
-        format_speed(results.download_speed)
-    );
-    println!(
-        "   Upload    {:>10}",
-        format_speed(results.upload_speed)
-    );
-    println!();
-    println!("   Latency");
-    println!("   Unloaded  {:>7.0} ms", results.latency_unloaded);
-    println!("   Loaded    {:>7.0} ms", results.latency_loaded);
-    println!();
-    println!(
-        "   Client     {}, {}",
-        client.location.city, client.location.country
-    );
-    println!(
-        "              {}  {}",
-        client.ip,
-        client.isp.as_deref().unwrap_or("Unknown")
-    );
-    println!("   Server(s)  {}", servers.join(" | "));
-    println!();
-    println!(
-        "   Data       {} ↓  {} ↑",
-        format_bytes(results.downloaded_bytes),
-        format_bytes(results.uploaded_bytes)
-    );
-    println!();
-}
+    // Show completed state briefly
+    tui.draw(&state, &history, client_info, servers, "Complete")?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
-fn format_speed(bits_per_sec: f64) -> String {
-    if bits_per_sec >= 1_000_000_000.0 {
-        format!("{:.1} Gbps", bits_per_sec / 1_000_000_000.0)
-    } else if bits_per_sec >= 100_000_000.0 {
-        format!("{:.0} Mbps", bits_per_sec / 1_000_000.0)
-    } else if bits_per_sec >= 1_000_000.0 {
-        format!("{:.1} Mbps", bits_per_sec / 1_000_000.0)
-    } else if bits_per_sec >= 1_000.0 {
-        format!("{:.0} Kbps", bits_per_sec / 1_000.0)
-    } else {
-        format!("{:.0} bps", bits_per_sec)
-    }
-}
+    // Restore terminal
+    drop(tui);
 
-fn format_bytes(bytes: u64) -> String {
-    if bytes >= 1_073_741_824 {
-        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
-    } else if bytes >= 1_048_576 {
-        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
-    } else if bytes >= 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{} B", bytes)
-    }
+    // Print final results to terminal
+    let results = TestResults {
+        download_speed: (download_bytes as f64 * 8.0) / elapsed,
+        upload_speed: (upload_bytes as f64 * 8.0) / elapsed,
+        latency_unloaded,
+        latency_loaded: state.get_median_latency(),
+        downloaded_bytes: download_bytes,
+        uploaded_bytes: upload_bytes,
+    };
+
+    display::print_results(&results, client_info, servers);
+    Ok(())
 }
