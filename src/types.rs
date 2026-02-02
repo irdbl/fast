@@ -34,6 +34,31 @@ pub struct TestResults {
     pub latency_loaded: f64,
     pub downloaded_bytes: u64,
     pub uploaded_bytes: u64,
+    pub nat_topology: Option<String>,
+    pub nat_type: Option<String>,
+    pub external_ip: Option<String>,
+    pub nat_confidence: Option<f64>,
+    pub nat_evidence: Vec<String>,
+    // UPnP results
+    pub upnp_available: bool,
+    pub upnp_gateway: Option<String>,
+    pub upnp_wan_ip: Option<String>,
+    pub upnp_can_map: bool,
+    // NAT-PMP/PCP results
+    pub nat_pmp_available: bool,
+    pub pcp_available: bool,
+    pub nat_pmp_external_ip: Option<String>,
+    // ICE candidates
+    pub ice_host: Vec<(String, u16)>,      // (ip, port)
+    pub ice_srflx: Vec<(String, u16)>,
+    // UDP connectivity
+    pub udp_3478: bool,
+    pub udp_443: bool,
+    pub udp_19302: bool,
+    // Network info
+    pub local_ip: Option<String>,
+    pub default_gateway: Option<String>,
+    pub dns_servers: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -41,8 +66,75 @@ pub struct JsonOutput {
     pub download: SpeedResult,
     pub upload: SpeedResult,
     pub latency: LatencyResult,
+    pub nat: NatResult,
     pub client: JsonClient,
     pub servers: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct NatResult {
+    pub topology: Option<String>,
+    #[serde(rename = "type")]
+    pub nat_type: Option<String>,
+    pub external_ip: Option<String>,
+    pub confidence: Option<f64>,
+    pub network: NetworkInfoJson,
+    pub evidence: Vec<String>,
+    pub upnp: UpnpInfo,
+    pub nat_pmp: NatPmpInfo,
+    pub ice_candidates: IceCandidatesInfo,
+    pub udp_connectivity: UdpConnectivityInfo,
+}
+
+#[derive(Serialize)]
+pub struct IceCandidateInfo {
+    pub address: String,
+    pub port: u16,
+    pub protocol: String,
+}
+
+#[derive(Serialize)]
+pub struct IceCandidatesInfo {
+    pub host: Vec<IceCandidateInfo>,
+    pub srflx: Vec<IceCandidateInfo>,
+    pub relay: Vec<IceCandidateInfo>,
+}
+
+#[derive(Serialize)]
+pub struct UdpConnectivityInfo {
+    #[serde(rename = "port_3478")]
+    pub port_3478: bool,
+    #[serde(rename = "port_443")]
+    pub port_443: bool,
+    #[serde(rename = "port_19302")]
+    pub port_19302: bool,
+}
+
+#[derive(Serialize)]
+pub struct NetworkInfoJson {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_gateway: Option<String>,
+    pub dns_servers: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct UpnpInfo {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wan_ip: Option<String>,
+    pub can_add_mapping: bool,
+}
+
+#[derive(Serialize)]
+pub struct NatPmpInfo {
+    pub nat_pmp_available: bool,
+    pub pcp_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_ip: Option<String>,
 }
 
 #[derive(Serialize)]

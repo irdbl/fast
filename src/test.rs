@@ -19,7 +19,8 @@ fn make_latency_url(base_url: &str) -> String {
 }
 
 fn make_download_url(base_url: &str) -> String {
-    make_url_with_path(base_url, &format!("/range/0-{}", CHUNK_SIZE))
+    // Range is inclusive, so subtract 1 to request exactly CHUNK_SIZE bytes.
+    make_url_with_path(base_url, &format!("/range/0-{}", CHUNK_SIZE - 1))
 }
 
 fn make_upload_url(base_url: &str) -> String {
@@ -70,15 +71,33 @@ pub fn spawn_download_tasks(
 
         handles.push(tokio::spawn(async move {
             while !stop_flag.load(Ordering::Relaxed) {
-                if let Ok(response) = client.get(&url).send().await {
+                if let Ok(response) = client
+                    .get(&url)
+                    .timeout(Duration::from_secs(10))
+                    .send()
+                    .await
+                {
                     let mut stream = response.bytes_stream();
 
-                    while let Some(chunk) = stream.next().await {
+                    loop {
                         if stop_flag.load(Ordering::Relaxed) {
                             break;
                         }
-                        if let Ok(data) = chunk {
-                            download_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+
+                        let next_chunk =
+                            tokio::time::timeout(Duration::from_secs(2), stream.next()).await;
+                        match next_chunk {
+                            Ok(Some(Ok(data))) => {
+                                download_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+                            }
+                            Ok(Some(Err(_))) => break,
+                            Ok(None) => break,
+                            Err(_) => {
+                                // Timeout waiting for data; re-check stop_flag.
+                                if stop_flag.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -118,8 +137,11 @@ pub fn spawn_upload_tasks(
                     .await
                 {
                     Ok(resp) => {
+                        let status_ok = resp.status().is_success();
                         let _ = resp.bytes().await;
-                        upload_bytes.fetch_add(chunk_size as u64, Ordering::Relaxed);
+                        if status_ok {
+                            upload_bytes.fetch_add(chunk_size as u64, Ordering::Relaxed);
+                        }
                     }
                     Err(_) => {
                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -165,4 +187,3 @@ pub fn spawn_latency_task(
         }
     })
 }
-
